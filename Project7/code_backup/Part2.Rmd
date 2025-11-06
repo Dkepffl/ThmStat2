@@ -1,0 +1,179 @@
+---
+title: "Part2"
+author: "YounYeowon"
+date: "2025-10-27"
+output:
+  html_document: default
+  word_document: default
+---
+```{r message=FALSE, warning=FALSE}
+### load libraries
+### load libraries
+library(readxl)
+library(stringr)
+library(skimr)
+
+library(tidyverse) # dplyr, ggplot2
+library(rsample) # for train/test split
+
+library(MASS)
+library(survival)
+
+### save my images
+knitr::opts_chunk$set(fig.path = "figures_Part2/")
+```
+
+```{r}
+### load data
+estimation_df <- read_excel("Data/과제#7-SAS보험이탈자료-분석용.xls", sheet=2)
+colnames(estimation_df) <- c('delta', # Target : 0 or 1
+                             'x1', 'x2', 'x3', 'x4', 'x5', 'x6', 'x7', 'x8', 'x9', 'x10', 'x11')
+
+head(estimation_df)
+```
+
+```{r}
+### basic data pre-processing
+clean_df <- estimation_df %>%
+  mutate(x8=case_when(
+    x8=='20110229' ~ '20110228',
+    x8=='20150229' ~ '20150228',
+    x8=='20180229' ~ '20180228',
+    x8=='20210229' ~ '20210228',
+    x8=='20250229' ~ '20250228',
+    x8=='20260229' ~ '20260228',
+    x8=='99990229' ~ '99990228',
+    TRUE ~ x8
+  )) %>%
+  # factor 변환
+  mutate(
+         x2=as.factor(x2), x4=as.factor(x4), # 납입방법, 수금방법
+         x6=as.factor(x6), # 부활유무(Binary)
+         x10=as.factor(x10), x11=as.factor(x11) # 상품중분류, 상품소분류
+         ) %>%
+  # 날짜 Date 변환
+  mutate(x7=as.Date(x7, format="%Y%m%d"), x8=as.Date(x8, format="%Y%m%d"))
+
+skim(clean_df)
+```
+```{r}
+## generate y(Target)
+cox_df <- clean_df %>% 
+  mutate(납입간격=case_when(x2=='1'~1, x2=='2'~3, x2=='3'~6, x2=='4'~12),
+         y = x9*납입간격) %>%
+  dplyr::select(-x9, -x2, -납입간격)
+```
+
+```{r}
+### 데이터 가공 pipeline
+data_pipeline <- function(origin_df, Train=T, scaling_params=NULL){
+  
+  ## 파생변수
+  df1 <- origin_df %>% mutate(무만기=(year(x8)==9999),
+                              지급만기기간=case_when(!무만기~round(as.double((x8-x7)/365)), 무만기~100),
+                              무만기=as.factor(무만기))
+  
+  ## 변수 제거
+  df2 <- df1 %>% dplyr::select(-x7, -x8) # 필요없는 변수 제거
+  
+  ## Log 변환 x3, x5
+  df3 <- df2 %>% mutate(x3=log(x3+1), x5=log(x5+1))
+  
+  ## 스케일링
+  df4 <- df3 %>% dplyr::select(-y, -delta)
+  target <- df3 %>% dplyr::select(y, delta)
+  col_to_scale <- c('x1', 'x3', 'x5', '지급만기기간')
+  
+  # Train data
+  if (Train){
+    scaling_params <- list() # Test Set에 적용할 파라미터를 저장할 리스트
+    
+    for (col in col_to_scale) {
+      scaled_col_matrix <- scale(df4[[col]])
+      df4[[col]] <- as.vector(scaled_col_matrix)
+      # for Test
+      scaling_params[[col]] <- list(
+        center = attr(scaled_col_matrix, "scaled:center"),
+        scale = attr(scaled_col_matrix, "scaled:scale"))
+    }
+    df4 <- cbind(df4, target)
+    return(list(df2, df3, df4, scaling_params))
+
+  }else {
+    for (col in col_to_scale) {
+      center_val <- scaling_params[[col]]$center
+      scale_val <- scaling_params[[col]]$scale
+      # test 데이터에 (x - train_mean) / train_sd 적용
+      df4[[col]] <- (df4[[col]] - center_val) / scale_val
+    }
+    df4 <- cbind(df4, target)
+    return(list(df2, df3, df4))
+  }
+}
+```
+
+```{r}
+data_split <- initial_split(cox_df, prop = 0.7, strata = delta)
+train <- training(data_split); test <- testing(data_split)
+
+res_data_train <- data_pipeline(train, Train=T)
+train_df_list <- res_data_train[-5]; scaling_par <- res_data_train[[4]]
+test_df_list <- data_pipeline(train, Train=F, scaling_params=scaling_par)
+```
+
+```{r}
+cox1.full <- coxph(Surv(y, delta) ~ x1+x3+x4+x5+x6+x10+x11+무만기+지급만기기간, 
+                  data = train_df_list[[1]])
+cox1.null <- coxph(Surv(y, delta) ~ 1, 
+                  data = train_df_list[[1]])
+cox1.both <- stepAIC(cox1.full, direction = "both", trace = 0)
+cox1.back <- stepAIC(cox1.full, direction = "backward", trace = 0)
+cox1.for <- stepAIC(cox1.null, direction = "forward", trace = 0)
+```
+
+```{r}
+AIC(cox1.both); AIC(cox1.back); AIC(cox1.for)
+```
+```{r}
+cox2.full <- coxph(Surv(y, delta) ~ x1+x3+x4+x5+x6+x10+x11+무만기+지급만기기간,
+                   data = train_df_list[[2]])
+cox2.null <- coxph(Surv(y, delta) ~ 1, 
+                  data = train_df_list[[2]])
+cox2.both <- stepAIC(cox2.full, direction = "both", trace = 0)
+cox2.back <- stepAIC(cox2.full, direction = "backward", trace = 0)
+cox2.for <- stepAIC(cox2.null, direction = "forward", trace = 0)
+```
+
+```{r}
+AIC(cox2.both); AIC(cox2.back); AIC(cox2.for)
+```
+
+```{r}
+cox3.full <- coxph(Surv(y, delta) ~ x1+x3+x4+x5+x6+x10+x11+무만기+지급만기기간, 
+                  data = train_df_list[[3]])
+cox3.null <- coxph(Surv(y, delta) ~ 1, 
+                  data = train_df_list[[3]])
+cox3.both <- stepAIC(cox3.full, direction = "both", trace = 0)
+cox3.back <- stepAIC(cox3.full, direction = "backward", trace = 0)
+cox3.for <- stepAIC(cox3.null, direction = "forward", trace = 0)
+```
+
+```{r}
+AIC(cox3.both); AIC(cox3.back); AIC(cox3.for)
+```
+
+```{r}
+summary(cox2.both); summary(cox3.both)
+```
+
+```{r}
+anova(cox2.both, cox3.both)
+```
+
+```{r}
+final_df <- data_pipeline(cox_df, Train=T)[[3]]
+best_cox <- coxph(formula(cox3.both), data = final_df)
+
+summary(best_cox)
+```
+
