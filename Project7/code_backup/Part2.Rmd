@@ -1,4 +1,11 @@
-
+---
+title: "Part2"
+author: "YounYeowon"
+date: "2025-11-07"
+output:
+  html_document: default
+  word_document: default
+---
 ```{r message=FALSE, warning=FALSE}
 ### load libraries
 ### load libraries
@@ -18,7 +25,7 @@ knitr::opts_chunk$set(fig.path = "figures_Part2/")
 
 ```{r}
 ### load data
-estimation_df <- read_excel("filename", sheet=2)
+estimation_df <- read_excel("Data/과제#7-SAS보험이탈자료-분석용.xls", sheet=2)
 colnames(estimation_df) <- c('delta', # Target : 0 or 1
                              'x1', 'x2', 'x3', 'x4', 'x5', 'x6', 'x7', 'x8', 'x9', 'x10', 'x11')
 
@@ -106,11 +113,11 @@ data_pipeline <- function(origin_df, Train=T, scaling_params=NULL){
 ```
 
 ```{r}
-data_split <- initial_split(cox_df, prop = 0.7, strata = delta)
+data_split <- initial_split(cox_df, prop = 0.8, strata = delta)
 train <- training(data_split); test <- testing(data_split)
 
 res_data_train <- data_pipeline(train, Train=T)
-train_df_list <- res_data_train[-5]; scaling_par <- res_data_train[[4]]
+train_df_list <- res_data_train[-4]; scaling_par <- res_data_train[[4]]
 test_df_list <- data_pipeline(train, Train=F, scaling_params=scaling_par)
 ```
 
@@ -167,7 +174,6 @@ anova(cox2.both, cox3.both)
 final_df <- data_pipeline(cox_df, Train=T)[[3]]
 best_cox <- coxph(formula(cox3.both), data = final_df)
 
-summary(best_cox)
+summary(best_cox); AIC(best_cox)
 ```
-
 
