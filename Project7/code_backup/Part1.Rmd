@@ -1,12 +1,3 @@
----
-title: "Part1"
-author: "YounYeowon"
-date: "2025-11-07"
-output:
-  html_document: default
-  word_document: default
----
-
 ```{r message=FALSE, warning=FALSE}
 ### load libraries
 library(readxl)
@@ -26,7 +17,7 @@ knitr::opts_chunk$set(fig.path = "figures_Part1/")
 
 ```{r}
 ### load data
-estimation_df <- read_excel("Data/과제#7-SAS보험이탈자료-분석용.xls", sheet=2)
+estimation_df <- read_excel("Data", sheet=2)
 colnames(estimation_df) <- c('delta', # Target : 0 or 1
                              'x1', 'x2', 'x3', 'x4', 'x5', 'x6', 'x7', 'x8', 'x9', 'x10', 'x11')
 
@@ -389,6 +380,7 @@ summary(best_glm); AIC(best_glm)
 ```{r}
 summary(best_gam); AIC(best_gam)
 ```
+
 
 
 
