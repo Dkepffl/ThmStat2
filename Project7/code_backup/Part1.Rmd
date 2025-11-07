@@ -1,0 +1,394 @@
+---
+title: "Part1"
+author: "YounYeowon"
+date: "2025-11-07"
+output:
+  html_document: default
+  word_document: default
+---
+
+```{r message=FALSE, warning=FALSE}
+### load libraries
+library(readxl)
+library(stringr)
+library(skimr)
+
+library(tidyverse) # dplyr, ggplot2
+library(rsample) # for train/test split
+
+library(car)
+library(bestglm) # best subset selection
+library(gam)
+
+### save my images
+knitr::opts_chunk$set(fig.path = "figures_Part1/")
+```
+
+```{r}
+### load data
+estimation_df <- read_excel("Data/과제#7-SAS보험이탈자료-분석용.xls", sheet=2)
+colnames(estimation_df) <- c('delta', # Target : 0 or 1
+                             'x1', 'x2', 'x3', 'x4', 'x5', 'x6', 'x7', 'x8', 'x9', 'x10', 'x11')
+
+head(estimation_df)
+```
+
+```{r}
+### basic data pre-processing
+clean_df <- estimation_df %>%
+  mutate(x8=case_when(
+    x8=='20110229' ~ '20110228',
+    x8=='20150229' ~ '20150228',
+    x8=='20180229' ~ '20180228',
+    x8=='20210229' ~ '20210228',
+    x8=='20250229' ~ '20250228',
+    x8=='20260229' ~ '20260228',
+    x8=='99990229' ~ '99990228',
+    TRUE ~ x8
+  )) %>%
+  # factor 변환
+  mutate(delta=as.factor(delta), # target
+         x2=as.factor(x2), x4=as.factor(x4), # 납입방법, 수금방법
+         x6=as.factor(x6), # 부활유무(Binary)
+         x10=as.factor(x10), x11=as.factor(x11) # 상품중분류, 상품소분류
+         ) %>%
+  # 날짜 Date 변환
+  mutate(x7=as.Date(x7, format="%Y%m%d"), x8=as.Date(x8, format="%Y%m%d")) %>% 
+  select(-delta, delta)
+
+skim(clean_df)
+```
+
+```{r}
+### 데이터 가공 pipeline
+data_pipeline <- function(origin_df, Train=T, scaling_params=NULL){
+  
+  ## 파생변수
+  df1 <- origin_df %>% 
+    mutate(x2=case_when(x2=='1'~1, x2=='2'~3, x2=='3'~6, x2=='4'~12),
+           최종납입기간=x9*x2,
+           남은납입횟수=((x2*x3*12)-x9),
+           # 월납보험료=x5/x2,
+           무만기= (year(x8)==9999),
+           지급만기기간=case_when(!무만기~round(as.double((x8-x7)/365)), 무만기~100)
+           ) %>%
+    # factor 변환
+    mutate(x2=as.factor(x2)) 
+  
+  ## 변수 제거
+  df2 <- df1 %>% dplyr::select(-x7, -x8) # 필요없는 변수 제거
+  df3 <- df2 %>% dplyr:: select(-x9) # 히트맵을 보고 파생 변수와 상관관계 큰 기존 변수 제외
+  
+  ## Log 변환 x3, x5, 최종납입기간, 남은납입횟수
+  df4 <- df3 %>% mutate(x3=log(x3+1), x5=log(x5+1), 
+                        최종납입기간=log(최종납입기간+1), 남은납입횟수=log(남은납입횟수+1))
+  
+  ## 스케일링
+  df5 <- df4
+  col_to_scale <- c('x1', 'x3', 'x5', '최종납입기간', '지급만기기간', '남은납입횟수')
+  
+  # Train data
+  if (Train){
+    scaling_params <- list() # Test Set에 적용할 파라미터를 저장할 리스트
+    
+    for (col in col_to_scale) {
+      scaled_col_matrix <- scale(df5[[col]])
+      df5[[col]] <- as.vector(scaled_col_matrix)
+      # for Test
+      scaling_params[[col]] <- list(
+        center = attr(scaled_col_matrix, "scaled:center"),
+        scale = attr(scaled_col_matrix, "scaled:scale"))
+    }
+    
+    ## 무만기 제외
+    df6 <- df5 %>% filter(!무만기) %>% select(-무만기)
+
+
+  }else {
+    for (col in col_to_scale) {
+      center_val <- scaling_params[[col]]$center
+      scale_val <- scaling_params[[col]]$scale
+      # test 데이터에 (x - train_mean) / train_sd 적용
+      df5[[col]] <- (df5[[col]] - center_val) / scale_val
+    }
+    df6 <- df5 %>% select(-무만기)
+  }
+  
+  
+  
+  if (Train){return(list(df2, df3, df4, df5, df6, scaling_params))}
+  else {return(list(df2, df3, df4, df5, df6))}
+}
+```
+
+```{r}
+### Train/Test Split
+set.seed(123) 
+data_split <- initial_split(clean_df, prop = 0.8, strata = delta)
+train <- training(data_split); test <- testing(data_split)
+
+res_data_train <- data_pipeline(train, Train=T)
+train_df_list <- res_data_train[-6]; scaling_par <- res_data_train[[6]]
+test_df_list <- data_pipeline(train, Train=F, scaling_params=scaling_par)
+```
+
+```{r}
+### Pipeline
+## Feature Selection for GLM
+# both, forward, backward
+feature_select <- function(full_model, null_model, df, alpha=0.15){
+  
+  scope_list <- list(upper = formula(full_model), lower = formula(null_model))
+  
+  # alpha=0.15
+  k_val <- qchisq(alpha, df = 1, lower.tail = FALSE)
+  forward <- step(null_model, scope=scope_list, direction="forward", k=k_val, trace=F)
+  backward <- step(full_model, scope=scope_list, direction="backward", k=k_val, trace=F)
+  both <- step(full_model, scope=scope_list, direction="both", k=k_val, trace=F)
+    
+  model_list <- list(forward, backward, both)
+  
+  score_AIC <- c(AIC(forward), AIC(backward), AIC(both))
+  best_idx <- which.min(score_AIC)
+  
+  return(model_list[[best_idx]])
+}
+
+## pipeline : Logistic GLM
+modeling_glm <- function(df){
+  # for bestGLM
+  df <- df %>% select(-delta, delta)
+  
+  ## link function
+  # logit
+  full_logit <- glm(delta ~ ., data=df, family=binomial(link = "logit"), model = TRUE)
+  null_logit <- glm(delta ~ 1, data=df, family=binomial(link = "logit"), model = TRUE)
+  #bsub_logit <- bestglm(Xy=df, family=binomial(link = "logit"), IC="AIC")
+  
+  # probit
+  full_probit <- glm(delta ~ ., data=df, family=binomial(link = "probit"), model = TRUE)
+  null_probit <- glm(delta ~ 1, data=df, family=binomial(link = "probit"), model = TRUE)
+  #bsub_probit <- bestglm(Xy=df, family=binomial(link = "probit"), IC="AIC")
+  
+  # cloglog
+  full_cloglog <- glm(delta ~ ., data=df, family=binomial(link = "cloglog"), model = TRUE)
+  null_cloglog <- glm(delta ~ 1, data=df, family=binomial(link = "cloglog"), model = TRUE)
+  #bsub_cloglog <- bestglm(Xy=df, family=binomial(link = "cloglog"), IC="AIC")
+  
+  best_logit <- feature_select(full_logit, null_logit, df)
+  best_probit <- feature_select(full_probit, null_probit, df)
+  best_cloglog <- feature_select(full_cloglog, null_cloglog, df)
+  
+  return(list(best_logit, best_probit, best_cloglog))
+}
+
+## pipeline : GAM
+modeling_gam <- function(df, model_form, gam_scope){
+  
+  ## Link function
+  # logit
+  gam_logit <- gam::gam(model_form, data=df, family=binomial(link = "logit"))
+  
+  # probit
+  gam_probit <- gam::gam(model_form, data=df, family=binomial(link = "probit"))
+  
+  # cloglog
+  gam_cloglog <- gam::gam(model_form, data=df, family=binomial(link = "cloglog"))
+  
+  ## data 수동 인식
+  gam_logit$call$data <- df
+  gam_probit$call$data <- df
+  gam_cloglog$call$data <- df
+  
+  ## 변수 선택
+  best_logit <- step.Gam(gam_logit, scope=gam_scope, trace=FALSE)
+  best_probit <- gam::step.Gam(gam_probit, scope = gam_scope, trace=FALSE)
+  best_cloglog <- gam::step.Gam(gam_cloglog, scope = gam_scope, trace=FALSE)
+  
+  ## 결과 반환
+  return(list(logit = best_logit,
+              probit = best_probit,
+              cloglog = best_cloglog))
+}
+
+## 모델 평가
+evaluate_models_manual <- function(model_list, test_data, threshold = 0.5) {
+  
+  results_list <- list() # 결과를 저장할 리스트
+  
+  model_names <- c("Logit", "Probit", "Cloglog") # 모델 이름
+  actual_labels <- test_data$delta # 테스트 데이터의 실제 타겟값
+  positive_class <- "1"; negative_class <- "0" # "1" (이탈)을 Positive class로 설정
+  
+  calculate_auc_manual <- function(labels, probs) {
+    ord <- order(probs, decreasing = TRUE)
+    labels_sorted <- as.numeric(labels[ord] == positive_class) # 1 if Positive, 0 if Negative
+    probs_sorted <- probs[ord]
+    
+    N_pos <- sum(labels_sorted == 1)
+    N_neg <- sum(labels_sorted == 0)
+    
+    if (N_pos == 0 || N_neg == 0) return(NA) 
+    
+    TPs <- cumsum(labels_sorted == 1); FPs <- cumsum(labels_sorted == 0)
+    TPRs <- TPs / N_pos; FPRs <- FPs / N_neg
+    
+    roc_df <- data.frame(FPR = c(0, FPRs), TPR = c(0, TPRs))
+    
+    roc_df_unique <- roc_df[!duplicated(roc_df), ]
+    
+    auc <- sum((roc_df_unique$FPR[-1]-roc_df_unique$FPR[-nrow(roc_df_unique)])*(roc_df_unique$TPR[-1] + roc_df_unique$TPR[-nrow(roc_df_unique)])/2)
+    
+    return(auc)
+  }
+  
+  
+  for (i in 1:length(model_list)) {
+    model <- model_list[[i]]
+    model_name <- model_names[i]
+    
+    aic_score <- tryCatch(AIC(model), error = function(e) NA)
+    
+    pred_probs <- tryCatch({
+      predict(model, newdata = test_data, type = "response")
+    }, error = function(e) NA)
+    
+    if (any(is.na(pred_probs))) {
+      results_list[[i]] <- data.frame(Model = model_name, AIC = aic_score, 
+                                      Accuracy = NA, F1_Score = NA, ROC_AUC = NA)
+      next
+    }
+    
+    pred_classes <- ifelse(pred_probs > threshold, positive_class, negative_class)
+    
+    # TP, TN, FP, FN 계산
+    TP <- sum(actual_labels == positive_class & pred_classes == positive_class)
+    TN <- sum(actual_labels == negative_class & pred_classes == negative_class)
+    FP <- sum(actual_labels == negative_class & pred_classes == positive_class)
+    FN <- sum(actual_labels == positive_class & pred_classes == negative_class)
+    
+    # Accuracy 계산
+    accuracy <- (TP + TN) / (TP + TN + FP + FN)
+    
+    # Precision, Recall, F1-Score 계산
+    epsilon <- 1e-9
+    precision <- TP / (TP + FP + epsilon)
+    recall    <- TP / (TP + FN + epsilon)
+    f1_score  <- 2 * (precision * recall) / (precision + recall + epsilon)
+    
+    # ROC-AUC
+    auc_score <- tryCatch({
+      calculate_auc_manual(labels = actual_labels, probs = pred_probs)
+    }, error = function(e) {
+      warning(paste("Manual AUC failed for model:", model_name, "-", e$message))
+      return(NA)
+    })
+    
+    # 결과 취합
+    results_list[[i]] <- data.frame(
+      Model = model_name,
+      AIC = aic_score,
+      Accuracy = accuracy,
+      F1_Score = f1_score,
+      ROC_AUC = auc_score
+    )
+  }
+  
+  final_df <- do.call(rbind, results_list)
+  row.names(final_df) <- NULL # index 초기화
+  
+  return(final_df)
+}
+```
+
+```{r warning=FALSE}
+### GLM
+## fitting
+glms1 <- modeling_glm(df=train_df_list[[1]])
+glms2 <- modeling_glm(df=train_df_list[[2]])
+glms3 <- modeling_glm(df=train_df_list[[3]])
+glms4 <- modeling_glm(df=train_df_list[[4]])
+glms5 <- modeling_glm(df=train_df_list[[5]])
+
+## evaluation
+glm.result1 <- evaluate_models_manual(model_list=glms1, test_data=test_df_list[[1]])
+glm.result2 <- evaluate_models_manual(model_list=glms2, test_data=test_df_list[[2]])
+glm.result3 <- evaluate_models_manual(model_list=glms3, test_data=test_df_list[[3]])
+glm.result4 <- evaluate_models_manual(model_list=glms4, test_data=test_df_list[[4]])
+glm.result5 <- evaluate_models_manual(model_list=glms5, test_data=test_df_list[[5]])
+
+glm.result1; glm.result2; glm.result3; glm.result4; glm.result5
+```
+
+```{r}
+### GAM
+## basic parameter
+gam_form <- formula(delta ~ x1 + x2 + x3 + x4 + x5 + x6 + x10 + x11 + 
+                      최종납입기간 + 남은납입횟수 + 무만기 + 지급만기기간)
+
+gam_scope <- list(
+  "x1" = ~1 + x1 + s(x1, 4) + s(x1, 8),
+  "x2" = ~1 + x2,
+  "x3" = ~1 + x3 + s(x3, 4) + s(x3, 8),
+  "x4" = ~1 + x4,
+  "x5" = ~1 + x5 + s(x5, 4) + s(x5, 8),
+  "x6" = ~1 + x6,
+  "x10" = ~1 + x10,
+  "x11" = ~1 + x11,
+  "최종납입기간" = ~1 + 최종납입기간 + s(최종납입기간, 4) + s(최종납입기간, 8),
+  "남은납입횟수" = ~1 + 남은납입횟수 + s(남은납입횟수, 4) + s(남은납입횟수, 8),
+  "무만기" = ~1 + 무만기,
+  "지급만기기간" = ~1 + 지급만기기간 + s(지급만기기간, 4) + s(지급만기기간, 8) # x15 오타 수정
+)
+```
+
+```{r}
+## fitting
+gams1 <- modeling_gam(df=train_df_list[[1]], model_form=gam_form, gam_scope=gam_scope)
+gams2 <- modeling_gam(df=train_df_list[[2]], model_form=gam_form, gam_scope=gam_scope)
+gams3 <- modeling_gam(df=train_df_list[[3]], model_form=gam_form, gam_scope=gam_scope)
+gams4 <- modeling_gam(df=train_df_list[[4]], model_form=gam_form, gam_scope=gam_scope)
+
+gam_form5 <- formula(delta~x1+x2+x3+x4+x5+x6+x10+x11+최종납입기간+남은납입횟수+지급만기기간)
+gam_scope5 = list("x1" = ~1 + x1 + s(x1, 4) + s(x1, 8),
+                 "x2" = ~1 + x2,
+                 "x3" = ~1 + x3 + s(x3, 4) + s(x3, 8),
+                 "x4" = ~1 + x4,
+                 "x5" = ~1 + x5 + s(x5, 4) + s(x5, 8),
+                 "x6" = ~1 + x6,
+                 "x10" = ~1 + x10,
+                 "x11" = ~1 + x11,
+                 "최종납입기간" = ~1 + s(최종납입기간,4) + s(최종납입기간,8),
+                 "남은납입횟수" = ~1 + s(남은납입횟수,4) + s(남은납입횟수,8),
+                 "지급만기기간" = ~1 + 지급만기기간 + s(지급만기기간, 4) + s(지급만기기간, 8))
+
+gams5 <- modeling_gam(df=train_df_list[[5]], model_form=gam_form5, gam_scope=gam_scope5)
+```
+
+```{r}
+gam.result1 <- evaluate_models_manual(model_list=gams1, test_data=test_df_list[[1]])
+gam.result2 <- evaluate_models_manual(model_list=gams2, test_data=test_df_list[[2]])
+gam.result3 <- evaluate_models_manual(model_list=gams3, test_data=test_df_list[[3]])
+gam.result4 <- evaluate_models_manual(model_list=gams4, test_data=test_df_list[[4]])
+gam.result5 <- evaluate_models_manual(model_list=gams5, test_data=test_df_list[[5]])
+
+gam.result1; gam.result2; gam.result3; gam.result4; gam.result5
+```
+
+```{r}
+### final fitting
+final_df <- data_pipeline(clean_df, Train=T)[[5]]
+best_glm <- glm(formula(glms5[[2]]), data=final_df, family=binomial(link = "probit"))
+best_gam <- gam(formula(gams5[[3]]), data=final_df, family=binomial(link = "cloglog"))
+```
+
+```{r}
+summary(best_glm); AIC(best_glm)
+```
+
+```{r}
+summary(best_gam); AIC(best_gam)
+```
+
+
+
